@@ -1,0 +1,8 @@
+{
+  "id": "craftengine-pack-gate",
+  "name": "CraftEnginePackGate",
+  "version": "1.0.0",
+  "main": "org.ellan.craftenginepackgate.CraftEnginePackGatePlugin",
+  "description": "Sends the CraftEngine resource pack from Velocity only when the current hash has not been applied.",
+  "authors": ["Ellan"]
+}
