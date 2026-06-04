@@ -102,6 +102,21 @@ When it receives `resend` or `resend:<sha>`, it reloads config/cache state, clea
 4. 确认日志出现 `CraftEnginePackGate enabled`。
 5. 进入配置的后端服务器，并查看 Velocity 日志中是否出现 `Sent CraftEngine resource pack ...`。
 
+## Automated Builds / 自动构建
+
+GitHub Actions builds the plugin on every push to `main`/`master`, every pull request, and manual workflow runs. The compiled jar is uploaded as a workflow artifact.
+
+GitHub Actions 会在每次推送到 `main`/`master`、每个 pull request，以及手动运行 workflow 时自动构建插件，并把编译好的 jar 上传为 workflow artifact。
+
+To publish a GitHub Release, push a version tag:
+
+```powershell
+git tag v1.3.3
+git push origin v1.3.3
+```
+
+推送 `v*` 版本标签后，workflow 会自动创建同名 GitHub Release，并把 jar 上传到 release assets。
+
 ## Verification / 验证
 
 - Cache files contain valid JSON with `url` and `sha1`.
