@@ -3,31 +3,28 @@ package org.ellan.craftenginepackgate;
 import com.google.inject.Inject;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
-import com.velocitypowered.api.event.connection.PluginMessageEvent;
+import com.velocitypowered.api.event.command.CommandExecuteEvent;
 import com.velocitypowered.api.event.player.PlayerResourcePackStatusEvent;
 import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
+import com.velocitypowered.api.plugin.Dependency;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
-import com.velocitypowered.api.proxy.ServerConnection;
 import com.velocitypowered.api.proxy.player.ResourcePackInfo;
-import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
+import com.velocitypowered.api.scheduler.ScheduledTask;
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -35,28 +32,35 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Plugin(
         id = "craftengine-pack-gate",
         name = "CraftEnginePackGate",
-        version = "1.2.0",
-        description = "Sends the latest CraftEngine resource pack from Velocity using CraftEngine upload cache files.",
-        authors = {"Ellan"}
+        version = "1.3.3",
+        description = "Sends mandatory CraftEngine resource packs after players join backend servers.",
+        authors = {"Ellan"},
+        dependencies = {@Dependency(id = "eaglerxserver", optional = true)}
 )
 public final class CraftEnginePackGatePlugin {
-    private static final MinecraftChannelIdentifier REFRESH_CHANNEL = MinecraftChannelIdentifier.from("craftengine_pack_gate:refresh");
     private static final String DEFAULT_CONFIG = """
-            force=false
+            force=true
             prompt=服务器材质包已更新，请加载以显示自定义物品和模型。
+            decline-message=你必须加载服务器材质包才能游玩 Ellan Network。
             auth-server=ellan-limbo
             minecraft-root=..
             auto-cache=true
+            send-delay-millis=1200
+            eagler-tab-footer-hide=true
+            eagler-tab-footer-delay-millis=750
+            eagler-tab-footer-repeat-millis=750
+            eagler-tab-header=
+            eagler-tab-footer=
+            block-eagler-tpsbar-command=true
+            block-eagler-tpsbar-message=TPS bar is disabled for Eaglercraft clients.
             packs=network
-            pack.network.url=https://example.invalid/resource_pack.zip
-            pack.network.sha1=0000000000000000000000000000000000000000
+            pack.network.url=https://gitlab.com/-/project/81919457/uploads/5c170053d4b5ca4a6eb0af8e26a2dbee/resource_pack.zip
+            pack.network.sha1=4af0034bbf720cffdd9a39b0e6cb8033f620b338
             pack.network.id=4a475da6-9760-4fc7-91af-10dd2d5725b4
             pack.network.servers=ellan-spawn,ellan-survival,ellan-redstone,ellan-adventure
             pack.network.cache-files=01-spawn/plugins/CraftEngine/cache/gitlab.json,02-survival/plugins/CraftEngine/cache/gitlab.json,03-redstone/plugins/CraftEngine/cache/gitlab.json,04-adventure/plugins/CraftEngine/cache/gitlab.json
@@ -69,12 +73,27 @@ public final class CraftEnginePackGatePlugin {
     private final Properties config = new Properties();
     private final Map<UUID, PackDefinition> pendingPlayers = new ConcurrentHashMap<>();
     private final Set<String> appliedThisSession = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> notifiedEaglerPlayers = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, ScheduledTask> eaglerTabFooterTasks = new ConcurrentHashMap<>();
 
     private String authServer;
     private boolean force;
+    private boolean autoCache;
+    private boolean skipEaglerPlayers;
+    private boolean hideEaglerTabFooter;
+    private boolean blockEaglerTpsbarCommand;
+    private boolean eaglerApiWarningLogged;
+    private long sendDelayMillis;
+    private long eaglerTabFooterDelayMillis;
+    private long eaglerTabFooterRepeatMillis;
     private String prompt;
+    private String declineMessage;
+    private String eaglerSkipMessage;
+    private String eaglerTabHeader;
+    private String eaglerTabFooter;
+    private String blockEaglerTpsbarMessage;
     private Path minecraftRoot;
-    private Map<String, PackConfig> packsByServer = Map.of();
+    private Map<String, PackConfig> packsByServer;
 
     @Inject
     public CraftEnginePackGatePlugin(ProxyServer proxy, Logger logger, @DataDirectory Path dataDirectory) {
@@ -86,262 +105,356 @@ public final class CraftEnginePackGatePlugin {
 
     @Subscribe
     public void onProxyInitialize(ProxyInitializeEvent event) {
-        proxy.getChannelRegistrar().register(REFRESH_CHANNEL);
         loadConfig();
         buildPackConfigs();
-        logger.info("CraftEnginePackGate enabled: server assignments={}", packsByServer.keySet());
-    }
-
-    @Subscribe
-    public void onPluginMessage(PluginMessageEvent event) {
-        if (!event.getIdentifier().equals(REFRESH_CHANNEL)) {
-            return;
-        }
-        event.setResult(PluginMessageEvent.ForwardResult.handled());
-
-        String message = new String(event.getData(), StandardCharsets.UTF_8).trim();
-        String source = event.getSource() instanceof ServerConnection connection
-                ? connection.getServerInfo().getName()
-                : String.valueOf(event.getSource());
-        loadConfig();
-        buildPackConfigs();
-        appliedThisSession.clear();
-
-        int sent = 0;
-        if (message.isBlank() || message.startsWith("resend")) {
-            sent = resendToOnlinePlayers();
-        }
-        logger.info("CraftEnginePackGate refresh requested by {} message='{}'; resent={} online={}", source, message, sent, proxy.getAllPlayers().size());
+        logger.info("CraftEnginePackGate enabled: force={}, sendDelayMillis={}, skipEaglerPlayers={}, hideEaglerTabFooter={}, server assignments={}", force, sendDelayMillis, skipEaglerPlayers, hideEaglerTabFooter, packsByServer.keySet());
     }
 
     @Subscribe
     public void onServerConnected(ServerConnectedEvent event) {
-        if (packsByServer.isEmpty()) {
-            return;
-        }
-
         Player player = event.getPlayer();
         String serverName = event.getServer().getServerInfo().getName();
+        cancelEaglerTabFooterOverride(player.getUniqueId());
+
         if (authServer.equals(serverName)) {
             return;
         }
 
-        PackConfig packConfig = packsByServer.get(serverName);
-        if (packConfig == null) {
+        if (hideEaglerTabFooter) {
+            scheduleEaglerTabFooterOverride(player, serverName);
+        }
+
+        if (packsByServer == null || packsByServer.isEmpty()) {
             return;
         }
 
-        Optional<PackDefinition> resolvedPack = resolvePack(packConfig);
-        if (resolvedPack.isEmpty()) {
+        PackConfig pack = packsByServer.get(serverName);
+        if (pack == null) {
             return;
         }
 
-        PackDefinition packDefinition = resolvedPack.get();
-        if (hasApplied(player, packDefinition)) {
-            return;
-        }
-
-        PackDefinition pendingPack = pendingPlayers.get(player.getUniqueId());
-        if (pendingPack != null && pendingPack.sha1().equals(packDefinition.sha1())) {
-            return;
-        }
-
-        appliedThisSession.add(key(player, packDefinition));
-        pendingPlayers.put(player.getUniqueId(), packDefinition);
-        try {
-            player.sendResourcePackOffer(packDefinition.info());
-            logger.info("Sent CraftEngine resource pack {} ({}) to {} on {} from {}", packDefinition.name(), packDefinition.sha1(), player.getUsername(), serverName, packDefinition.source());
-        } catch (IllegalStateException exception) {
-            pendingPlayers.remove(player.getUniqueId());
-            logger.warn("Skipped CraftEngine resource pack {} ({}) for {} on {}: {}", packDefinition.name(), packDefinition.sha1(), player.getUsername(), serverName, exception.getMessage());
-        }
+        proxy.getScheduler()
+                .buildTask(this, () -> sendPackIfStillNeeded(player.getUniqueId(), serverName, pack))
+                .delay(Duration.ofMillis(sendDelayMillis))
+                .schedule();
     }
 
     @Subscribe
     public void onResourcePackStatus(PlayerResourcePackStatusEvent event) {
         Player player = event.getPlayer();
-        PackDefinition pendingPack = pendingPlayers.get(player.getUniqueId());
-        if (pendingPack == null || !pendingPack.info().getId().equals(event.getPackId())) {
+        PackDefinition pack = pendingPlayers.get(player.getUniqueId());
+        if (pack == null || !pack.info().getId().equals(event.getPackId())) {
             return;
         }
 
         PlayerResourcePackStatusEvent.Status status = event.getStatus();
         if (status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL) {
-            appliedThisSession.add(key(player, pendingPack));
+            appliedThisSession.add(key(player, pack));
             pendingPlayers.remove(player.getUniqueId());
-            logger.info("{} applied CraftEngine resource pack {} ({})", player.getUsername(), pendingPack.name(), pendingPack.sha1());
+            logger.info("{} applied mandatory CraftEngine resource pack {} ({})", player.getUsername(), pack.name(), pack.sha1());
             return;
         }
 
-        if (!status.isIntermediate()) {
-            pendingPlayers.remove(player.getUniqueId());
-            appliedThisSession.remove(key(player, pendingPack));
-            logger.warn("{} did not apply CraftEngine resource pack {} ({}) (status: {})", player.getUsername(), pendingPack.name(), pendingPack.sha1(), status);
+        if (status.isIntermediate()) {
+            logger.info("{} resource pack {} status: {}", player.getUsername(), pack.name(), status);
+            return;
+        }
+
+        pendingPlayers.remove(player.getUniqueId());
+        appliedThisSession.remove(key(player, pack));
+        logger.warn("{} did not apply mandatory CraftEngine resource pack {} ({}) (status: {})", player.getUsername(), pack.name(), pack.sha1(), status);
+        if (force) {
+            player.disconnect(Component.text(declineMessage));
         }
     }
 
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
         String prefix = event.getPlayer().getUniqueId() + ":";
-        appliedThisSession.removeIf(entry -> entry.startsWith(prefix));
+        appliedThisSession.removeIf(key -> key.startsWith(prefix));
         pendingPlayers.remove(event.getPlayer().getUniqueId());
+        notifiedEaglerPlayers.remove(event.getPlayer().getUniqueId());
+        cancelEaglerTabFooterOverride(event.getPlayer().getUniqueId());
+    }
+    @Subscribe
+    public void onCommandExecute(CommandExecuteEvent event) {
+        if (!blockEaglerTpsbarCommand || !(event.getCommandSource() instanceof Player player)) {
+            return;
+        }
+
+        String command = event.getCommand().trim().toLowerCase(Locale.ROOT);
+        if (!command.equals("tpsbar") && !command.startsWith("tpsbar ")
+                && !command.equals("purpur:tpsbar") && !command.startsWith("purpur:tpsbar ")) {
+            return;
+        }
+
+        if (!isEaglerPlayer(player)) {
+            return;
+        }
+
+        event.setResult(CommandExecuteEvent.CommandResult.denied());
+        if (!blockEaglerTpsbarMessage.isBlank()) {
+            player.sendMessage(Component.text(blockEaglerTpsbarMessage));
+        }
+        logger.info("Blocked TPS bar command '{}' for Eagler player {}", event.getCommand(), player.getUsername());
+    }
+    private void sendPackIfStillNeeded(UUID playerId, String serverName, PackConfig packConfig) {
+        Optional<Player> optionalPlayer = proxy.getPlayer(playerId);
+        if (optionalPlayer.isEmpty()) {
+            return;
+        }
+
+        Player player = optionalPlayer.get();
+        String currentServer = player.getCurrentServer()
+                .map(connection -> connection.getServerInfo().getName())
+                .orElse("");
+        if (!serverName.equals(currentServer)) {
+            return;
+        }
+
+        Optional<PackDefinition> resolvedPack = resolvePack(packConfig);
+        if (resolvedPack.isEmpty()) {
+            logger.warn("No valid CraftEngine resource pack available for {} on {}", player.getUsername(), serverName);
+            return;
+        }
+
+        PackDefinition pack = resolvedPack.get();
+        if (appliedThisSession.contains(key(player, pack))) {
+            return;
+        }
+
+        if (skipEaglerPlayers && isEaglerPlayer(player)) {
+            if (!eaglerSkipMessage.isBlank() && notifiedEaglerPlayers.add(player.getUniqueId())) {
+                player.sendMessage(Component.text(eaglerSkipMessage));
+            }
+            logger.info("Skipped mandatory Java resource pack {} ({}) for Eagler player {} on {}", pack.name(), pack.sha1(), player.getUsername(), serverName);
+            return;
+        }
+
+        pendingPlayers.put(player.getUniqueId(), pack);
+        try {
+            player.sendResourcePackOffer(pack.info());
+            logger.info("Sent mandatory CraftEngine resource pack {} ({}, force={}) to {} on {} from {}", pack.name(), pack.sha1(), force, player.getUsername(), serverName, pack.source());
+        } catch (IllegalStateException exception) {
+            pendingPlayers.remove(player.getUniqueId());
+            logger.warn("Skipped mandatory CraftEngine resource pack {} ({}) for {} on {}: {}", pack.name(), pack.sha1(), player.getUsername(), serverName, exception.getMessage());
+        }
     }
 
-    private int resendToOnlinePlayers() {
-        int sent = 0;
-        for (Player player : proxy.getAllPlayers()) {
-            Optional<ServerConnection> currentServer = player.getCurrentServer();
-            if (currentServer.isEmpty()) {
-                continue;
-            }
-
-            String serverName = currentServer.get().getServerInfo().getName();
-            if (authServer.equals(serverName)) {
-                continue;
-            }
-
-            PackConfig packConfig = packsByServer.get(serverName);
-            if (packConfig == null) {
-                continue;
-            }
-
-            Optional<PackDefinition> resolvedPack = resolvePack(packConfig);
-            if (resolvedPack.isEmpty()) {
-                continue;
-            }
-
-            PackDefinition packDefinition = resolvedPack.get();
-            try {
-                pendingPlayers.put(player.getUniqueId(), packDefinition);
-                appliedThisSession.add(key(player, packDefinition));
-                player.sendResourcePackOffer(packDefinition.info());
-                sent++;
-                logger.info("Resent CraftEngine resource pack {} ({}) to {} on {} from {}", packDefinition.name(), packDefinition.sha1(), player.getUsername(), serverName, packDefinition.source());
-            } catch (IllegalStateException exception) {
-                pendingPlayers.remove(player.getUniqueId());
-                appliedThisSession.remove(key(player, packDefinition));
-                logger.warn("Skipped CraftEngine resource pack resend {} ({}) for {} on {}: {}", packDefinition.name(), packDefinition.sha1(), player.getUsername(), serverName, exception.getMessage());
-            }
+    private void scheduleEaglerTabFooterOverride(Player player, String serverName) {
+        if (!isEaglerPlayer(player)) {
+            return;
         }
-        return sent;
+
+        UUID playerId = player.getUniqueId();
+        ScheduledTask task = proxy.getScheduler()
+                .buildTask(this, () -> applyEaglerTabFooterOverride(playerId, serverName))
+                .delay(Duration.ofMillis(eaglerTabFooterDelayMillis))
+                .repeat(Duration.ofMillis(eaglerTabFooterRepeatMillis))
+                .schedule();
+        eaglerTabFooterTasks.put(playerId, task);
+        logger.info("Hiding TAB TPS footer for Eagler player {} on {}", player.getUsername(), serverName);
+    }
+
+    private void applyEaglerTabFooterOverride(UUID playerId, String serverName) {
+        Optional<Player> optionalPlayer = proxy.getPlayer(playerId);
+        if (optionalPlayer.isEmpty()) {
+            cancelEaglerTabFooterOverride(playerId);
+            return;
+        }
+
+        Player player = optionalPlayer.get();
+        String currentServer = player.getCurrentServer()
+                .map(connection -> connection.getServerInfo().getName())
+                .orElse("");
+        if (!serverName.equals(currentServer)) {
+            cancelEaglerTabFooterOverride(playerId);
+            return;
+        }
+
+        player.sendPlayerListHeaderAndFooter(componentOrEmpty(eaglerTabHeader), componentOrEmpty(eaglerTabFooter));
+    }
+
+    private void cancelEaglerTabFooterOverride(UUID playerId) {
+        ScheduledTask task = eaglerTabFooterTasks.remove(playerId);
+        if (task != null) {
+            task.cancel();
+        }
+    }
+
+    private Component componentOrEmpty(String text) {
+        if (text == null || text.isBlank()) {
+            return Component.empty();
+        }
+        return Component.text(text);
+    }
+
+    private boolean isEaglerPlayer(Player player) {
+        try {
+            Class<?> velocityApiClass = Class.forName("net.lax1dude.eaglercraft.backend.server.api.velocity.EaglerXServerAPI");
+            Object api = velocityApiClass.getMethod("instance").invoke(null);
+            if (api == null) {
+                return false;
+            }
+            Class<?> apiInterface = Class.forName("net.lax1dude.eaglercraft.backend.server.api.IEaglerXServerAPI");
+            Object result = apiInterface.getMethod("isEaglerPlayerByUUID", UUID.class).invoke(api, player.getUniqueId());
+            return Boolean.TRUE.equals(result);
+        } catch (ClassNotFoundException exception) {
+            return false;
+        } catch (ReflectiveOperationException | LinkageError exception) {
+            if (!eaglerApiWarningLogged) {
+                eaglerApiWarningLogged = true;
+                logger.warn("Could not query EaglerXServer API; Java resource packs will be sent to all players until this is fixed: {}", exception.getMessage());
+            }
+            return false;
+        }
     }
 
     private void buildPackConfigs() {
-        force = Boolean.parseBoolean(config.getProperty("force", "false"));
+        force = Boolean.parseBoolean(config.getProperty("force", "true"));
+        autoCache = Boolean.parseBoolean(config.getProperty("auto-cache", "true"));
+        skipEaglerPlayers = Boolean.parseBoolean(config.getProperty("skip-eagler-players", "true"));
+        hideEaglerTabFooter = Boolean.parseBoolean(config.getProperty("eagler-tab-footer-hide", "true"));
+        blockEaglerTpsbarCommand = Boolean.parseBoolean(config.getProperty("block-eagler-tpsbar-command", "true"));
+        sendDelayMillis = Math.max(0L, Long.parseLong(config.getProperty("send-delay-millis", "1200")));
+        eaglerTabFooterDelayMillis = Math.max(0L, Long.parseLong(config.getProperty("eagler-tab-footer-delay-millis", "750")));
+        eaglerTabFooterRepeatMillis = Math.max(250L, Long.parseLong(config.getProperty("eagler-tab-footer-repeat-millis", "750")));
         prompt = config.getProperty("prompt", "Server resource pack updated.");
+        declineMessage = config.getProperty("decline-message", "You must accept the server resource pack to play.");
+        eaglerSkipMessage = config.getProperty("eagler-skip-message", "Eaglercraft does not support this Java resource pack prompt. Use Java Edition for the full resource pack.");
+        eaglerTabHeader = config.getProperty("eagler-tab-header", "");
+        eaglerTabFooter = config.getProperty("eagler-tab-footer", "");
+        blockEaglerTpsbarMessage = config.getProperty("block-eagler-tpsbar-message", "TPS bar is disabled for Eaglercraft clients.");
         authServer = config.getProperty("auth-server", "ellan-limbo").trim();
         minecraftRoot = resolveMinecraftRoot();
-        boolean autoCache = Boolean.parseBoolean(config.getProperty("auto-cache", "true"));
 
         Map<String, PackConfig> assignments = new LinkedHashMap<>();
         for (String packName : splitList(config.getProperty("packs", ""))) {
             String prefix = "pack." + packName + ".";
-            String staticUrl = requireConfig(prefix + "url");
-            String staticSha1 = requireConfig(prefix + "sha1").toLowerCase(Locale.ROOT);
-            UUID packId = UUID.fromString(requireConfig(prefix + "id"));
-            List<Path> cacheFiles = autoCache ? resolveCacheFiles(prefix) : List.of();
-            PackConfig packConfig = new PackConfig(packName, staticUrl, staticSha1, packId, cacheFiles);
+            PackConfig pack = new PackConfig(
+                    packName,
+                    requireConfig(prefix + "url"),
+                    requireConfig(prefix + "sha1").toLowerCase(Locale.ROOT),
+                    UUID.fromString(requireConfig(prefix + "id")),
+                    splitList(config.getProperty(prefix + "cache-files", ""))
+            );
             for (String serverName : splitList(config.getProperty(prefix + "servers", ""))) {
-                assignments.put(serverName, packConfig);
+                assignments.put(serverName, pack);
             }
         }
         packsByServer = Map.copyOf(assignments);
     }
 
     private Optional<PackDefinition> resolvePack(PackConfig packConfig) {
-        Optional<CachedPack> cachedPack = packConfig.cacheFiles().stream()
-                .map(this::readCachedPack)
-                .flatMap(Optional::stream)
-                .max(Comparator.comparingLong(CachedPack::lastModified));
+        String url = packConfig.url();
+        String sha1 = packConfig.sha1();
+        String source = "config";
 
-        String url = cachedPack.map(CachedPack::url).orElse(packConfig.staticUrl());
-        String sha1 = cachedPack.map(CachedPack::sha1).orElse(packConfig.staticSha1()).toLowerCase(Locale.ROOT);
-        String source = cachedPack.map(cached -> cached.path().toString()).orElse("config.properties");
+        if (autoCache) {
+            for (Path cacheFile : resolveCacheFiles(packConfig)) {
+                Optional<CachedPack> cachedPack = readCachedPack(cacheFile);
+                if (cachedPack.isPresent() && isSha1(cachedPack.get().sha1())) {
+                    url = cachedPack.get().url();
+                    sha1 = cachedPack.get().sha1().toLowerCase(Locale.ROOT);
+                    source = cacheFile.toString();
+                    break;
+                }
+            }
+        }
 
-        if (!isSha1(sha1) || url.isBlank()) {
-            logger.warn("Invalid CraftEngine resource pack {} from {}: url='{}' sha1='{}'", packConfig.name(), source, url, sha1);
+        if (!isSha1(sha1)) {
+            logger.warn("Invalid SHA-1 for CraftEngine resource pack {}: {}", packConfig.name(), sha1);
             return Optional.empty();
         }
 
-        try {
-            byte[] hash = HexFormat.of().parseHex(sha1);
-            ResourcePackInfo info = proxy.createResourcePackBuilder(url)
-                    .setId(packConfig.id())
-                    .setHash(hash)
-                    .setShouldForce(force)
-                    .setPrompt(Component.text(prompt))
-                    .build();
-            return Optional.of(new PackDefinition(packConfig.name(), sha1, info, source));
-        } catch (RuntimeException exception) {
-            logger.warn("Failed to build CraftEngine resource pack {} from {}: {}", packConfig.name(), source, exception.getMessage());
-            return Optional.empty();
-        }
+        ResourcePackInfo info = proxy.createResourcePackBuilder(url)
+                .setId(packConfig.id())
+                .setHash(HexFormat.of().parseHex(sha1))
+                .setShouldForce(force)
+                .setPrompt(Component.text(prompt))
+                .build();
+        return Optional.of(new PackDefinition(packConfig.name(), sha1, info, source));
     }
 
     private Optional<CachedPack> readCachedPack(Path cacheFile) {
-        try {
-            if (!Files.isRegularFile(cacheFile)) {
-                return Optional.empty();
-            }
-            String json = Files.readString(cacheFile, StandardCharsets.UTF_8);
-            String url = extractJsonString(json, "url").orElse("").trim();
-            String sha1 = extractJsonString(json, "sha1").orElse("").trim().toLowerCase(Locale.ROOT);
-            if (url.isBlank() || !isSha1(sha1)) {
-                return Optional.empty();
-            }
-            long lastModified = Files.getLastModifiedTime(cacheFile).toMillis();
-            return Optional.of(new CachedPack(url, sha1, cacheFile, lastModified));
-        } catch (IOException exception) {
-            logger.warn("Failed to read CraftEngine upload cache {}: {}", cacheFile, exception.getMessage());
+        if (!Files.isRegularFile(cacheFile)) {
             return Optional.empty();
         }
+        try {
+            String json = Files.readString(cacheFile, StandardCharsets.UTF_8);
+            Optional<String> url = extractJsonString(json, "url");
+            Optional<String> sha1 = extractJsonString(json, "sha1").or(() -> extractJsonString(json, "hash"));
+            if (url.isPresent() && sha1.isPresent()) {
+                return Optional.of(new CachedPack(url.get(), sha1.get()));
+            }
+        } catch (IOException exception) {
+            logger.warn("Failed to read CraftEngine pack cache {}: {}", cacheFile, exception.getMessage());
+        }
+        return Optional.empty();
     }
 
     private Optional<String> extractJsonString(String json, String key) {
-        Pattern pattern = Pattern.compile("\\\"" + Pattern.quote(key) + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
-        Matcher matcher = pattern.matcher(json);
-        if (!matcher.find()) {
+        String pattern = "\"" + key + "\"";
+        int keyIndex = json.indexOf(pattern);
+        if (keyIndex < 0) {
             return Optional.empty();
         }
-        return Optional.of(matcher.group(1).replace("\\/", "/"));
+        int colonIndex = json.indexOf(':', keyIndex + pattern.length());
+        if (colonIndex < 0) {
+            return Optional.empty();
+        }
+        int firstQuote = json.indexOf('"', colonIndex + 1);
+        if (firstQuote < 0) {
+            return Optional.empty();
+        }
+        StringBuilder value = new StringBuilder();
+        boolean escaped = false;
+        for (int index = firstQuote + 1; index < json.length(); index++) {
+            char character = json.charAt(index);
+            if (escaped) {
+                value.append(character);
+                escaped = false;
+                continue;
+            }
+            if (character == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (character == '"') {
+                return Optional.of(value.toString());
+            }
+            value.append(character);
+        }
+        return Optional.empty();
     }
 
-    private List<Path> resolveCacheFiles(String prefix) {
-        String configured = config.getProperty(prefix + "cache-files", "").trim();
-        if (configured.isEmpty()) {
-            configured = "01-spawn/plugins/CraftEngine/cache/gitlab.json,02-survival/plugins/CraftEngine/cache/gitlab.json,03-redstone/plugins/CraftEngine/cache/gitlab.json,04-adventure/plugins/CraftEngine/cache/gitlab.json";
-        }
-        return splitList(configured).stream()
-                .map(Paths::get)
+    private Set<Path> resolveCacheFiles(PackConfig packConfig) {
+        return packConfig.cacheFiles().stream()
+                .map(Path::of)
                 .map(path -> path.isAbsolute() ? path : minecraftRoot.resolve(path).normalize())
-                .toList();
+                .collect(Collectors.toUnmodifiableSet());
     }
 
     private Path resolveMinecraftRoot() {
-        Path absoluteDataDirectory = dataDirectory.toAbsolutePath().normalize();
-        Path pluginsDirectory = absoluteDataDirectory.getParent();
-        if (pluginsDirectory == null || pluginsDirectory.getParent() == null) {
-            throw new IllegalStateException("Cannot resolve Velocity root from data directory: " + absoluteDataDirectory);
+        String configuredRoot = config.getProperty("minecraft-root", "..").trim();
+        Path root = Path.of(configuredRoot);
+        if (!root.isAbsolute()) {
+            root = dataDirectory.resolve(root).normalize();
         }
-        Path velocityRoot = pluginsDirectory.getParent();
-        Path configuredRoot = Paths.get(config.getProperty("minecraft-root", "..").trim());
-        if (!configuredRoot.isAbsolute()) {
-            configuredRoot = velocityRoot.resolve(configuredRoot);
-        }
-        return configuredRoot.normalize();
+        return root;
     }
 
     private Set<String> splitList(String value) {
         return Arrays.stream(value.split(","))
                 .map(String::trim)
-                .filter(entry -> !entry.isEmpty())
+                .filter(item -> !item.isEmpty())
                 .collect(Collectors.toUnmodifiableSet());
     }
 
     private String requireConfig(String key) {
         String value = config.getProperty(key, "").trim();
         if (value.isEmpty()) {
-            throw new IllegalStateException("Missing config value: " + key);
+            throw new IllegalStateException("Missing required config key: " + key);
         }
         return value;
     }
@@ -352,7 +465,7 @@ public final class CraftEnginePackGatePlugin {
             if (!Files.exists(configFile)) {
                 Files.writeString(configFile, DEFAULT_CONFIG, StandardCharsets.UTF_8);
             }
-            try (BufferedReader reader = Files.newBufferedReader(configFile, StandardCharsets.UTF_8)) {
+            try (var reader = Files.newBufferedReader(configFile, StandardCharsets.UTF_8)) {
                 config.load(reader);
             }
         } catch (IOException exception) {
@@ -360,22 +473,18 @@ public final class CraftEnginePackGatePlugin {
         }
     }
 
-    private boolean hasApplied(Player player, PackDefinition packDefinition) {
-        return appliedThisSession.contains(key(player, packDefinition));
-    }
-
-    private String key(Player player, PackDefinition packDefinition) {
-        return player.getUniqueId() + ":" + packDefinition.sha1();
-    }
-
     private boolean isSha1(String value) {
-        return value.matches("(?i)[0-9a-f]{40}");
+        return value != null && value.matches("(?i)[0-9a-f]{40}");
     }
 
-    private record PackConfig(String name, String staticUrl, String staticSha1, UUID id, List<Path> cacheFiles) {
+    private String key(Player player, PackDefinition pack) {
+        return player.getUniqueId() + ":" + pack.sha1();
     }
 
-    private record CachedPack(String url, String sha1, Path path, long lastModified) {
+    private record PackConfig(String name, String url, String sha1, UUID id, Set<String> cacheFiles) {
+    }
+
+    private record CachedPack(String url, String sha1) {
     }
 
     private record PackDefinition(String name, String sha1, ResourcePackInfo info, String source) {
