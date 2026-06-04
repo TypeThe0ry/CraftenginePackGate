@@ -4,11 +4,10 @@ CraftEnginePackGate is a Velocity plugin that sends the latest uploaded CraftEng
 
 CraftEnginePackGate 是一个 Velocity 插件，用于在代理层下发最新的 CraftEngine 上传资源包。它读取 CraftEngine 上传缓存文件，选择最新有效的 URL/SHA-1，并在玩家进入指定后端后发送一个统一的网络资源包。
 
-## Why It Exists / 设计目标
+## Downloads / 下载
 
-Backend resource-pack sending can easily create duplicate prompts in a proxy network. This plugin centralizes delivery in Velocity while still letting CraftEngine own the pack upload process.
-
-在代理网络中由后端发送资源包很容易导致重复弹窗。本插件将资源包下发集中到 Velocity，同时仍保留 CraftEngine 负责上传资源包。
+Pls Go to Actions
+请前往Github Actions
 
 ## Platform / 平台
 
