@@ -2,8 +2,8 @@ package org.ellan.craftenginepackgate;
 
 import com.google.inject.Inject;
 import com.velocitypowered.api.event.Subscribe;
-import com.velocitypowered.api.event.command.CommandExecuteEvent;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
+import com.velocitypowered.api.event.command.CommandExecuteEvent;
 import com.velocitypowered.api.event.player.PlayerResourcePackStatusEvent;
 import com.velocitypowered.api.event.player.ServerConnectedEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
@@ -12,8 +12,6 @@ import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
-import com.velocitypowered.api.proxy.ServerConnection;
-import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.proxy.player.ResourcePackInfo;
 import com.velocitypowered.api.scheduler.ScheduledTask;
 import net.kyori.adventure.text.Component;
@@ -39,30 +37,26 @@ import java.util.stream.Collectors;
 @Plugin(
         id = "craftengine-pack-gate",
         name = "CraftEnginePackGate",
-        version = "1.4.0",
+        version = "1.3.3",
         description = "Sends mandatory CraftEngine resource packs after players join backend servers.",
         authors = {"Ellan"},
         dependencies = {@Dependency(id = "eaglerxserver", optional = true)}
 )
 public final class CraftEnginePackGatePlugin {
-    private static final MinecraftChannelIdentifier EAGLER_STATUS_CHANNEL = MinecraftChannelIdentifier.from("craftenginepackgate:eagler");
     private static final String DEFAULT_CONFIG = """
             force=true
-            prompt=Server resource pack updated. Please load it to display custom items and models.
-            decline-message=You must accept the server resource pack to play on Ellan Network.
+            prompt=服务器材质包已更新，请加载以显示自定义物品和模型。
+            decline-message=你必须加载服务器材质包才能游玩 Ellan Network。
             auth-server=ellan-limbo
             minecraft-root=..
             auto-cache=true
-            skip-eagler-players=true
             send-delay-millis=1200
-            eagler-tab-footer-hide=false
+            eagler-tab-footer-hide=true
             eagler-tab-footer-delay-millis=750
             eagler-tab-footer-repeat-millis=750
             eagler-tab-header=
             eagler-tab-footer=
-            eagler-status-forward=true
-            eagler-status-forward-delay-millis=250
-            block-eagler-tpsbar-command=false
+            block-eagler-tpsbar-command=true
             block-eagler-tpsbar-message=TPS bar is disabled for Eaglercraft clients.
             packs=network
             pack.network.url=https://gitlab.com/-/project/81919457/uploads/5c170053d4b5ca4a6eb0af8e26a2dbee/resource_pack.zip
@@ -87,13 +81,11 @@ public final class CraftEnginePackGatePlugin {
     private boolean autoCache;
     private boolean skipEaglerPlayers;
     private boolean hideEaglerTabFooter;
-    private boolean forwardEaglerStatus;
     private boolean blockEaglerTpsbarCommand;
     private boolean eaglerApiWarningLogged;
     private long sendDelayMillis;
     private long eaglerTabFooterDelayMillis;
     private long eaglerTabFooterRepeatMillis;
-    private long eaglerStatusForwardDelayMillis;
     private String prompt;
     private String declineMessage;
     private String eaglerSkipMessage;
@@ -115,8 +107,7 @@ public final class CraftEnginePackGatePlugin {
     public void onProxyInitialize(ProxyInitializeEvent event) {
         loadConfig();
         buildPackConfigs();
-        proxy.getChannelRegistrar().register(EAGLER_STATUS_CHANNEL);
-        logger.info("CraftEnginePackGate enabled: force={}, sendDelayMillis={}, skipEaglerPlayers={}, forwardEaglerStatus={}, hideEaglerTabFooter={}, server assignments={}", force, sendDelayMillis, skipEaglerPlayers, forwardEaglerStatus, hideEaglerTabFooter, packsByServer.keySet());
+        logger.info("CraftEnginePackGate enabled: force={}, sendDelayMillis={}, skipEaglerPlayers={}, hideEaglerTabFooter={}, server assignments={}", force, sendDelayMillis, skipEaglerPlayers, hideEaglerTabFooter, packsByServer.keySet());
     }
 
     @Subscribe
@@ -127,10 +118,6 @@ public final class CraftEnginePackGatePlugin {
 
         if (authServer.equals(serverName)) {
             return;
-        }
-
-        if (forwardEaglerStatus) {
-            scheduleEaglerStatusForward(player, serverName);
         }
 
         if (hideEaglerTabFooter) {
@@ -189,7 +176,6 @@ public final class CraftEnginePackGatePlugin {
         notifiedEaglerPlayers.remove(event.getPlayer().getUniqueId());
         cancelEaglerTabFooterOverride(event.getPlayer().getUniqueId());
     }
-
     @Subscribe
     public void onCommandExecute(CommandExecuteEvent event) {
         if (!blockEaglerTpsbarCommand || !(event.getCommandSource() instanceof Player player)) {
@@ -212,7 +198,6 @@ public final class CraftEnginePackGatePlugin {
         }
         logger.info("Blocked TPS bar command '{}' for Eagler player {}", event.getCommand(), player.getUsername());
     }
-
     private void sendPackIfStillNeeded(UUID playerId, String serverName, PackConfig packConfig) {
         Optional<Player> optionalPlayer = proxy.getPlayer(playerId);
         if (optionalPlayer.isEmpty()) {
@@ -297,35 +282,6 @@ public final class CraftEnginePackGatePlugin {
         }
     }
 
-    private void scheduleEaglerStatusForward(Player player, String serverName) {
-        boolean eaglerPlayer = isEaglerPlayer(player);
-        forwardEaglerStatusIfStillConnected(player.getUniqueId(), serverName, eaglerPlayer);
-        proxy.getScheduler()
-                .buildTask(this, () -> forwardEaglerStatusIfStillConnected(player.getUniqueId(), serverName, eaglerPlayer))
-                .delay(Duration.ofMillis(eaglerStatusForwardDelayMillis))
-                .schedule();
-        proxy.getScheduler()
-                .buildTask(this, () -> forwardEaglerStatusIfStillConnected(player.getUniqueId(), serverName, eaglerPlayer))
-                .delay(Duration.ofMillis(Math.max(1000L, eaglerStatusForwardDelayMillis * 4L)))
-                .schedule();
-    }
-
-    private void forwardEaglerStatusIfStillConnected(UUID playerId, String serverName, boolean eaglerPlayer) {
-        Optional<Player> optionalPlayer = proxy.getPlayer(playerId);
-        if (optionalPlayer.isEmpty()) {
-            return;
-        }
-
-        Player player = optionalPlayer.get();
-        Optional<ServerConnection> currentServer = player.getCurrentServer();
-        if (currentServer.isEmpty() || !serverName.equals(currentServer.get().getServerInfo().getName())) {
-            return;
-        }
-
-        currentServer.get().sendPluginMessage(EAGLER_STATUS_CHANNEL, new byte[] { (byte) (eaglerPlayer ? 1 : 0) });
-        logger.debug("Forwarded Eagler status {} for {} to {}", eaglerPlayer, player.getUsername(), serverName);
-    }
-
     private Component componentOrEmpty(String text) {
         if (text == null || text.isBlank()) {
             return Component.empty();
@@ -358,13 +314,11 @@ public final class CraftEnginePackGatePlugin {
         force = Boolean.parseBoolean(config.getProperty("force", "true"));
         autoCache = Boolean.parseBoolean(config.getProperty("auto-cache", "true"));
         skipEaglerPlayers = Boolean.parseBoolean(config.getProperty("skip-eagler-players", "true"));
-        hideEaglerTabFooter = Boolean.parseBoolean(config.getProperty("eagler-tab-footer-hide", "false"));
-        forwardEaglerStatus = Boolean.parseBoolean(config.getProperty("eagler-status-forward", "true"));
-        blockEaglerTpsbarCommand = Boolean.parseBoolean(config.getProperty("block-eagler-tpsbar-command", "false"));
+        hideEaglerTabFooter = Boolean.parseBoolean(config.getProperty("eagler-tab-footer-hide", "true"));
+        blockEaglerTpsbarCommand = Boolean.parseBoolean(config.getProperty("block-eagler-tpsbar-command", "true"));
         sendDelayMillis = Math.max(0L, Long.parseLong(config.getProperty("send-delay-millis", "1200")));
         eaglerTabFooterDelayMillis = Math.max(0L, Long.parseLong(config.getProperty("eagler-tab-footer-delay-millis", "750")));
         eaglerTabFooterRepeatMillis = Math.max(250L, Long.parseLong(config.getProperty("eagler-tab-footer-repeat-millis", "750")));
-        eaglerStatusForwardDelayMillis = Math.max(0L, Long.parseLong(config.getProperty("eagler-status-forward-delay-millis", "250")));
         prompt = config.getProperty("prompt", "Server resource pack updated.");
         declineMessage = config.getProperty("decline-message", "You must accept the server resource pack to play.");
         eaglerSkipMessage = config.getProperty("eagler-skip-message", "Eaglercraft does not support this Java resource pack prompt. Use Java Edition for the full resource pack.");
