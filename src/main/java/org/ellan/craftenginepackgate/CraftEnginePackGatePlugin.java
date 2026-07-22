@@ -76,7 +76,9 @@ public final class CraftEnginePackGatePlugin {
     private final Logger logger;
     private final Path dataDirectory;
     private final Path configFile;
+    private final Path appliedHashesFile;
     private final Properties config = new Properties();
+    private final Map<UUID, String> appliedHashes = new ConcurrentHashMap<>();
     private final Map<UUID, PackDefinition> pendingPlayers = new ConcurrentHashMap<>();
     private final Set<String> appliedThisSession = ConcurrentHashMap.newKeySet();
     private final Set<UUID> notifiedEaglerPlayers = ConcurrentHashMap.newKeySet();
@@ -109,11 +111,13 @@ public final class CraftEnginePackGatePlugin {
         this.logger = logger;
         this.dataDirectory = dataDirectory;
         this.configFile = dataDirectory.resolve("config.properties");
+        this.appliedHashesFile = dataDirectory.resolve("applied-hashes.properties");
     }
 
     @Subscribe
     public void onProxyInitialize(ProxyInitializeEvent event) {
         loadConfig();
+        loadAppliedHashes();
         buildPackConfigs();
         proxy.getChannelRegistrar().register(EAGLER_STATUS_CHANNEL);
         logger.info("CraftEnginePackGate enabled: force={}, sendDelayMillis={}, skipEaglerPlayers={}, forwardEaglerStatus={}, hideEaglerTabFooter={}, server assignments={}", force, sendDelayMillis, skipEaglerPlayers, forwardEaglerStatus, hideEaglerTabFooter, packsByServer.keySet());
@@ -163,6 +167,8 @@ public final class CraftEnginePackGatePlugin {
         PlayerResourcePackStatusEvent.Status status = event.getStatus();
         if (status == PlayerResourcePackStatusEvent.Status.SUCCESSFUL) {
             appliedThisSession.add(key(player, pack));
+            appliedHashes.put(player.getUniqueId(), pack.sha1());
+            saveAppliedHashes();
             pendingPlayers.remove(player.getUniqueId());
             logger.info("{} applied mandatory CraftEngine resource pack {} ({})", player.getUsername(), pack.name(), pack.sha1());
             return;
@@ -234,7 +240,7 @@ public final class CraftEnginePackGatePlugin {
         }
 
         PackDefinition pack = resolvedPack.get();
-        if (appliedThisSession.contains(key(player, pack))) {
+        if (appliedThisSession.contains(key(player, pack)) || pack.sha1().equals(appliedHashes.get(player.getUniqueId()))) {
             return;
         }
 
@@ -503,6 +509,34 @@ public final class CraftEnginePackGatePlugin {
             throw new IllegalStateException("Missing required config key: " + key);
         }
         return value;
+    }
+
+    private void loadAppliedHashes() {
+        if (!Files.isRegularFile(appliedHashesFile)) {
+            return;
+        }
+        Properties hashes = new Properties();
+        try (var reader = Files.newBufferedReader(appliedHashesFile, StandardCharsets.UTF_8)) {
+            hashes.load(reader);
+            for (String playerId : hashes.stringPropertyNames()) {
+                String sha1 = hashes.getProperty(playerId, "").toLowerCase(Locale.ROOT);
+                if (isSha1(sha1)) {
+                    appliedHashes.put(UUID.fromString(playerId), sha1);
+                }
+            }
+        } catch (IOException | IllegalArgumentException exception) {
+            logger.warn("Failed to load applied resource-pack hashes: {}", exception.getMessage());
+        }
+    }
+
+    private void saveAppliedHashes() {
+        Properties hashes = new Properties();
+        appliedHashes.forEach((playerId, sha1) -> hashes.setProperty(playerId.toString(), sha1));
+        try (var writer = Files.newBufferedWriter(appliedHashesFile, StandardCharsets.UTF_8)) {
+            hashes.store(writer, "Resource packs successfully applied by player UUID");
+        } catch (IOException exception) {
+            logger.warn("Failed to save applied resource-pack hashes: {}", exception.getMessage());
+        }
     }
 
     private void loadConfig() {
